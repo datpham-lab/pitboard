@@ -1,0 +1,207 @@
+name: root-build
+
+# Theo dõi release của upstream, áp patch cho phép chạy root, build bản Linux (musl, static)
+# rồi tạo GitHub Release trong fork với tag <upstream tag>-root.
+on:
+  schedule:
+    # GitHub tính cron theo UTC. 00:07 UTC = 07:07 giờ Việt Nam (UTC+7), mỗi ngày.
+    # Lệch vài phút khỏi :00 để tránh giờ cao điểm của GitHub, khi lịch chạy hay bị trễ.
+    - cron: "7 0 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag upstream cụ thể (vd v0.15.0). Để trống = mới nhất theo channel"
+        required: false
+        default: ""
+      channel:
+        description: "Lấy bản mới nhất từ kênh nào khi không nhập tag"
+        type: choice
+        options: [stable, prerelease]
+        default: stable
+      force:
+        description: "Build lại và ghi đè release đã có"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: root-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: datlechin/pitboard
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.r.outputs.tag }}
+      release: ${{ steps.r.outputs.release }}
+      prerelease: ${{ steps.r.outputs.prerelease }}
+      build: ${{ steps.r.outputs.build }}
+    steps:
+      - id: r
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          CHANNEL: ${{ inputs.channel || 'stable' }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -eu
+          if [ -n "$INPUT_TAG" ]; then
+            tag=$INPUT_TAG
+            prerelease=$(gh api "repos/$UPSTREAM/releases/tags/$tag" --jq '.prerelease' 2>/dev/null || echo false)
+          else
+            if [ "$CHANNEL" = prerelease ]; then
+              filter='[.[] | select(.draft == false)][0]'
+            else
+              filter='[.[] | select(.draft == false and .prerelease == false)][0]'
+            fi
+            # API trả release mới nhất trước.
+            json=$(gh api "repos/$UPSTREAM/releases?per_page=30" --jq "$filter")
+            tag=$(printf '%s' "$json" | jq -r '.tag_name')
+            prerelease=$(printf '%s' "$json" | jq -r '.prerelease')
+          fi
+          if [ -z "$tag" ] || [ "$tag" = null ]; then
+            echo "Không tìm thấy release upstream nào" >&2
+            exit 1
+          fi
+          release="${tag}-root"
+          build=true
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$release" >/dev/null 2>&1 \
+            && [ "$FORCE" != true ]; then
+            build=false
+            echo "$release đã có, bỏ qua." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo "tag=$tag"
+            echo "release=$release"
+            echo "prerelease=$prerelease"
+            echo "build=$build"
+          } >> "$GITHUB_OUTPUT"
+          echo "upstream=$tag release=$release prerelease=$prerelease build=$build"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      RELEASE: ${{ needs.resolve.outputs.release }}
+    steps:
+      - name: Checkout fork (scripts)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+          persist-credentials: false
+
+      - name: Checkout upstream ${{ needs.resolve.outputs.tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.resolve.outputs.tag }}
+          path: src
+          persist-credentials: false
+
+      - name: Apply allow-root patch
+        run: python3 fork/scripts/allow-root.py src
+
+      - name: Toolchain
+        working-directory: src
+        run: |
+          rustup toolchain install
+          rustup target add "$TARGET"
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          # ring biên dịch C, cần compiler nhắm tới musl (giống release.yml của upstream).
+          echo "CC_$(echo "$TARGET" | tr '-' '_')=musl-gcc" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('src/Cargo.lock') }}
+
+      - name: Build
+        working-directory: src
+        run: cargo build --release --locked -p pitboard --target "$TARGET"
+
+      - name: Smoke test as root
+        run: |
+          set -eu
+          bin="src/target/$TARGET/release/pitboard"
+          "$bin" --version
+          # Chạy qua sudo: vừa euid 0 vừa có SUDO_UID, cả hai đều phải được cho qua.
+          out=$(sudo env HOME="$(mktemp -d)" "$bin" use smoke-test 2>&1 || true)
+          printf '%s\n' "$out"
+          if printf '%s' "$out" | grep -qi "root or with sudo"; then
+            echo "Patch không có tác dụng: binary vẫn chặn root" >&2
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          set -eu
+          name="pitboard-${RELEASE}-${TARGET}"
+          mkdir -p dist
+          cp "src/target/$TARGET/release/pitboard" dist/pitboard
+          tar -C dist -czf "$name.tar.gz" pitboard
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            pitboard-*.tar.gz
+            pitboard-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE: ${{ needs.resolve.outputs.release }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+        run: |
+          set -eu
+          ls -la dist
+          if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release delete "$RELEASE" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          fi
+          flags=""
+          [ "$PRERELEASE" = true ] && flags="--prerelease"
+          notes="Upstream [$TAG](https://github.com/$UPSTREAM/releases/tag/$TAG) + patch cho phép chạy bằng root/sudo trên Linux.
+
+          Không có chữ ký hay notarize: chỉ dùng nội bộ."
+          # shellcheck disable=SC2086
+          gh release create "$RELEASE" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE" \
+            --notes "$notes" \
+            $flags
