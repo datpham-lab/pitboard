@@ -160,7 +160,9 @@ jobs:
           name="pitboard-${RELEASE}-${TARGET}"
           mkdir -p dist
           cp "src/target/$TARGET/release/pitboard" dist/pitboard
-          tar -C dist -czf "$name.tar.gz" pitboard
+          # Apache-2.0: phát hành lại thì kèm LICENSE và NOTICE của upstream.
+          cp src/LICENSE src/NOTICE dist/
+          tar -C dist -czf "$name.tar.gz" pitboard LICENSE NOTICE
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v4

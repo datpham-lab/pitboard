@@ -1,0 +1,9 @@
+[Unit]
+Description=Update patched Pitboard from datpham-lab/pitboard releases
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PITBOARD_FORK=datpham-lab/pitboard
+ExecStart=/usr/local/sbin/pitboard-update

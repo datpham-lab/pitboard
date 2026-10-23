@@ -5,17 +5,16 @@
 #   sh install.sh v0.15.0-root    # một bản cụ thể (cả prerelease)
 #
 # Biến môi trường:
-#   PITBOARD_FORK         owner/repo của fork (bắt buộc nếu chưa sửa giá trị mặc định dưới đây)
+#   PITBOARD_FORK         owner/repo lấy release, mặc định datpham-lab/pitboard
 #   PITBOARD_INSTALL_DIR  nơi cài, mặc định /usr/local/bin
 set -eu
 
-REPO="${PITBOARD_FORK:-OWNER/pitboard}"
+REPO="${PITBOARD_FORK:-datpham-lab/pitboard}"
 DEST="${PITBOARD_INSTALL_DIR:-/usr/local/bin}"
 TAG="${1:-}"
 
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-[ "$REPO" = "OWNER/pitboard" ] && fail "Đặt PITBOARD_FORK=<owner>/<repo> hoặc sửa REPO trong script."
 [ "$(uname -s)" = Linux ] || fail "Script này chỉ dành cho Linux."
 
 case $(uname -m) in

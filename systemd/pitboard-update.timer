@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily Pitboard update at 07:45 Vietnam time
+
+[Timer]
+OnCalendar=*-*-* 07:45:00 Asia/Ho_Chi_Minh
+Persistent=true
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
